@@ -23,8 +23,8 @@ PAY_BASE_URL = os.getenv('PAY_BASE_URL', 'https://bot-1792590140-8792-maks746395
 MIN_TOPUP, MAX_TOPUP = 50, 15000
 AD_COST = 500
 MAX_CHANNEL_POSTS = 5
-MIN_PRICE = 50
-PRICE_STEP_PERCENT = 10
+MIN_PRICE = 50       # старт аукциона
+BID_STEP = 10        # шаг ставки
 TEST_BALANCE = 50000000
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -59,11 +59,11 @@ def init_db():
         banned INTEGER DEFAULT 0, ban_reason TEXT DEFAULT '')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, chat_id INTEGER,
         amount INTEGER, paid INTEGER DEFAULT 0, created INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS prices (target TEXT PRIMARY KEY,
-        current_price INTEGER DEFAULT 50, last_user INTEGER DEFAULT 0,
-        last_value TEXT DEFAULT '', updated INTEGER DEFAULT 0)""")
-    for t in ("channel_name", "channel_desc", "chat_name", "chat_desc"):
-        cur.execute("INSERT OR IGNORE INTO prices (target, current_price) VALUES (?, ?)", (t, MIN_PRICE))
+    cur.execute("""CREATE TABLE IF NOT EXISTS auctions (target TEXT PRIMARY KEY,
+        current_bid INTEGER DEFAULT 0, current_user INTEGER DEFAULT 0,
+        current_value TEXT DEFAULT '', updated INTEGER DEFAULT 0)""")
+    for t in ("channel_name", "channel_desc", "chat_name", "chat_desc", "channel_photo", "chat_photo"):
+        cur.execute("INSERT OR IGNORE INTO auctions (target, current_bid) VALUES (?, 0)", (t,))
     c.commit(); c.close()
 
 
@@ -116,18 +116,25 @@ def add_bal(cid, amt):
     c.commit(); c.close()
 
 
-def get_price(target):
+def get_auc(target):
     c = get_conn(); cur = c.cursor()
-    cur.execute("SELECT current_price, last_user, last_value FROM prices WHERE target=?", (target,))
+    cur.execute("SELECT current_bid, current_user, current_value FROM auctions WHERE target=?", (target,))
     r = cur.fetchone(); c.close()
-    return r if r else (MIN_PRICE, 0, '')
+    return r if r else (0, 0, '')
 
 
-def set_price(target, price, user, val):
+def set_auc(target, bid, user, val):
     c = get_conn(); c.cursor().execute(
-        "UPDATE prices SET current_price=?, last_user=?, last_value=?, updated=? WHERE target=?",
-        (price, user, val, int(time.time()), target))
+        "UPDATE auctions SET current_bid=?, current_user=?, current_value=?, updated=? WHERE target=?",
+        (bid, user, val, int(time.time()), target))
     c.commit(); c.close()
+
+
+def calc_min_bid(target):
+    bid, user, val = get_auc(target)
+    if bid == 0:
+        return MIN_PRICE
+    return bid + BID_STEP
 
 
 # ============================================================
@@ -159,7 +166,7 @@ def giga_token():
 def ai_check(text, ctx="channel"):
     if not text:
         return True, "OK"
-    # Ники запрещены ТОЛЬКО в названиях/описаниях (в рекламе/постах — можно)
+    # Ники запрещены ТОЛЬКО в названиях/описаниях
     if ctx in ("title", "description") and re.search(r'@\w+', text):
         return False, "Ники (@username) запрещены в названии/описании"
     if re.search(r'https?://|t\.me/|www\.', text, re.I):
@@ -283,6 +290,7 @@ def channel_menu():
     m = telebot.types.InlineKeyboardMarkup()
     m.add(telebot.types.InlineKeyboardButton("✏️ Изменить название", callback_data="ch_name"))
     m.add(telebot.types.InlineKeyboardButton("📝 Изменить описание", callback_data="ch_desc"))
+    m.add(telebot.types.InlineKeyboardButton("🖼 Изменить фото", callback_data="ch_photo"))
     m.add(telebot.types.InlineKeyboardButton("📢 Опубликовать пост", callback_data="ch_post"))
     m.add(telebot.types.InlineKeyboardButton(f"📣 Реклама ({AD_COST}₽)", callback_data="ch_ad"))
     m.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
@@ -293,6 +301,7 @@ def chat_menu():
     m = telebot.types.InlineKeyboardMarkup()
     m.add(telebot.types.InlineKeyboardButton("✏️ Изменить название", callback_data="chat_name"))
     m.add(telebot.types.InlineKeyboardButton("📝 Изменить описание", callback_data="chat_desc"))
+    m.add(telebot.types.InlineKeyboardButton("🖼 Изменить фото", callback_data="chat_photo"))
     m.add(telebot.types.InlineKeyboardButton("⭐ Репутация", callback_data="chat_rep"))
     m.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
     return m
@@ -325,9 +334,6 @@ def start(message):
     if message.from_user.username:
         upd(message.chat.id, 'username', f"@{message.from_user.username}")
 
-    u = get_user(message.chat.id)
-
-    # Пригласительные ссылки (показываем при каждом /start, но отдельным сообщением)
     links = telebot.types.InlineKeyboardMarkup()
     if CHANNEL_LINK:
         links.add(telebot.types.InlineKeyboardButton("📺 Войти в канал", url=CHANNEL_LINK))
@@ -336,8 +342,7 @@ def start(message):
 
     if links.keyboard:
         bot.send_message(message.chat.id,
-            f"💎 <b>Добро пожаловать!</b>\n\n"
-            f"👇 Сначала подпишись на канал и чат:",
+            f"💎 <b>Добро пожаловать!</b>\n\n👇 Сначала подпишись на канал и чат:",
             parse_mode='HTML', reply_markup=links)
 
     bot.send_message(message.chat.id, main_text(message.chat.id),
@@ -357,6 +362,14 @@ def cb_back(c):
 @bot.callback_query_handler(func=lambda c: c.data == "open_links")
 def cb_open_links(c):
     bot.answer_callback_query(c.id)
+    if not CHANNEL_LINK and not CHAT_LINK:
+        try:
+            bot.edit_message_text(
+                "⚠️ Ссылки не настроены.\nДобавь CHANNEL_LINK и CHAT_LINK в переменные BotHost.",
+                chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=back_kb())
+        except Exception:
+            pass
+        return
     m = telebot.types.InlineKeyboardMarkup()
     if CHANNEL_LINK:
         m.add(telebot.types.InlineKeyboardButton("📺 Канал", url=CHANNEL_LINK))
@@ -425,15 +438,8 @@ def cb_chatmenu(c):
         pass
 
 # ============================================================
-# СМЕНА НАЗВАНИЯ / ОПИСАНИЯ (2 шага: текст → сумма)
+# СМЕНА НАЗВАНИЯ / ОПИСАНИЯ (аукцион: старт 50, шаг +10)
 # ============================================================
-
-def calc_min_price(target):
-    price, last_user, last_value = get_price(target)
-    if not last_value:
-        return MIN_PRICE
-    return int(price * (1 + PRICE_STEP_PERCENT / 100.0))
-
 
 def do_change_text(message, target, kind):
     """Шаг 1: пользователь ввёл название/описание."""
@@ -452,54 +458,45 @@ def do_change_text(message, target, kind):
         bot.send_message(message.chat.id, f"❌ ИИ: {r}", reply_markup=back_kb())
         return
 
-    min_price = calc_min_price(target)
+    min_bid = calc_min_bid(target)
     balance = get_user(message.chat.id)[0]
+    cur_bid, cur_user, cur_val = get_auc(target)
 
-    if balance < min_price:
+    if balance < min_bid:
         bot.send_message(message.chat.id,
             f"❌ <b>Недостаточно средств!</b>\n\n"
-            f"Минимальная ставка: <b>{min_price} ₽</b>\n"
-            f"У тебя: <b>{balance} ₽</b>\n\n"
-            f"Пополни баланс и попробуй снова.",
+            f"Минимальная ставка: <b>{min_bid} ₽</b>\n"
+            f"У тебя: <b>{balance} ₽</b>\n\nПополни баланс и попробуй снова.",
             parse_mode='HTML', reply_markup=back_kb())
         return
 
+    info = f"🎯 Текущая ставка: <b>{cur_bid} ₽</b>" if cur_bid else "🎯 Ставок ещё нет"
     sent = bot.send_message(message.chat.id,
         f"✅ Текст принят: <b>{new}</b>\n\n"
-        f"💰 Минимальная ставка: <b>{min_price} ₽</b>\n"
-        f"💎 Баланс: <b>{balance} ₽</b>\n\n"
-        f"Введи сумму, которую готов заплатить (не меньше {min_price} ₽):",
+        f"{info}\n💰 Минимальная ставка: <b>{min_bid} ₽</b>\n💎 Баланс: <b>{balance} ₽</b>\n\n"
+        f"Введи сумму ставки (не меньше {min_bid} ₽):",
         parse_mode='HTML')
-    bot.register_next_step_handler(sent, lambda m: do_change_pay(m, target, kind, new, min_price))
+    bot.register_next_step_handler(sent, lambda m: do_change_pay(m, target, kind, new, min_bid))
 
 
-def do_change_pay(message, target, kind, new_text, min_price):
-    """Шаг 2: пользователь ввёл сумму."""
+def do_change_pay(message, target, kind, new_text, min_bid):
     try:
         pay = int((message.text or "").strip())
     except ValueError:
         bot.send_message(message.chat.id, "❌ Введи число (сумму в рублях).", reply_markup=back_kb())
         return
-
-    if pay < min_price:
-        bot.send_message(message.chat.id,
-            f"❌ Ставка должна быть не меньше <b>{min_price} ₽</b>.",
-            parse_mode='HTML', reply_markup=back_kb())
-        return
-
+    if pay < min_bid:
+        bot.send_message(message.chat.id, f"❌ Ставка не меньше <b>{min_bid} ₽</b>.",
+            parse_mode='HTML', reply_markup=back_kb()); return
     balance = get_user(message.chat.id)[0]
     if balance < pay:
         bot.send_message(message.chat.id,
-            f"❌ <b>Не хватает средств!</b>\n\n"
-            f"Нужно: <b>{pay} ₽</b>\n"
-            f"У тебя: <b>{balance} ₽</b>\n"
-            f"Не хватает: <b>{pay - balance} ₽</b>\n\n"
-            f"Пополни баланс и попробуй снова.",
-            parse_mode='HTML', reply_markup=back_kb())
-        return
+            f"❌ Не хватает средств!\n\nНужно: <b>{pay} ₽</b>\nУ тебя: <b>{balance} ₽</b>\n"
+            f"Не хватает: <b>{pay - balance} ₽</b>",
+            parse_mode='HTML', reply_markup=back_kb()); return
 
     add_bal(message.chat.id, -pay)
-    set_price(target, pay, message.chat.id, new_text)
+    set_auc(target, pay, message.chat.id, new_text)
 
     try:
         if target == "channel_name":
@@ -514,13 +511,10 @@ def do_change_pay(message, target, kind, new_text, min_price):
         bot.send_message(message.chat.id, f"⚠️ Не удалось изменить: {e}", reply_markup=back_kb())
         return
 
-    next_price = int(pay * 1.1)
     bot.send_message(message.chat.id,
-        f"✅ <b>Изменено!</b>\n\n"
-        f"📝 Новое значение: <b>{new_text}</b>\n"
-        f"💸 Заплачено: <b>{pay} ₽</b>\n"
-        f"💰 Остаток: <b>{get_user(message.chat.id)[0]} ₽</b>\n\n"
-        f"Следующая смена — от <b>{next_price} ₽</b>.",
+        f"✅ <b>Изменено!</b>\n\n📝 Новое значение: <b>{new_text}</b>\n"
+        f"💸 Ставка: <b>{pay} ₽</b>\n💰 Остаток: <b>{get_user(message.chat.id)[0]} ₽</b>\n\n"
+        f"Следующая ставка — от <b>{pay + BID_STEP} ₽</b>.",
         parse_mode='HTML', reply_markup=back_kb())
     notify_admin(f"✏️ <b>Смена {target}</b>\n👤 <code>{message.chat.id}</code>\n💵 {pay} ₽\n📝 {new_text}")
 
@@ -530,7 +524,7 @@ def cb_chname(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
     s = bot.send_message(c.message.chat.id,
-        f"✏️ Введи новое <b>название канала</b> (мин. ставка {calc_min_price('channel_name')} ₽):",
+        f"✏️ Введи новое <b>название канала</b> (мин. ставка {calc_min_bid('channel_name')} ₽):",
         parse_mode='HTML')
     bot.register_next_step_handler(s, lambda m: do_change_text(m, "channel_name", "title"))
 
@@ -540,7 +534,7 @@ def cb_chdesc(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
     s = bot.send_message(c.message.chat.id,
-        f"📝 Введи новое <b>описание канала</b> (мин. ставка {calc_min_price('channel_desc')} ₽):",
+        f"📝 Введи новое <b>описание канала</b> (мин. ставка {calc_min_bid('channel_desc')} ₽):",
         parse_mode='HTML')
     bot.register_next_step_handler(s, lambda m: do_change_text(m, "channel_desc", "description"))
 
@@ -550,7 +544,7 @@ def cb_chname2(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
     s = bot.send_message(c.message.chat.id,
-        f"✏️ Введи новое <b>название чата</b> (мин. ставка {calc_min_price('chat_name')} ₽):",
+        f"✏️ Введи новое <b>название чата</b> (мин. ставка {calc_min_bid('chat_name')} ₽):",
         parse_mode='HTML')
     bot.register_next_step_handler(s, lambda m: do_change_text(m, "chat_name", "title"))
 
@@ -560,9 +554,95 @@ def cb_chdesc2(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
     s = bot.send_message(c.message.chat.id,
-        f"📝 Введи новое <b>описание чата</b> (мин. ставка {calc_min_price('chat_desc')} ₽):",
+        f"📝 Введи новое <b>описание чата</b> (мин. ставка {calc_min_bid('chat_desc')} ₽):",
         parse_mode='HTML')
     bot.register_next_step_handler(s, lambda m: do_change_text(m, "chat_desc", "description"))
+
+
+# ============================================================
+# СМЕНА ФОТО КАНАЛА / ЧАТА
+# ============================================================
+
+def do_photo_change(message, target):
+    if not message.photo:
+        bot.send_message(message.chat.id, "❌ Отправь фото (не файл).", reply_markup=back_kb())
+        return
+    file_id = message.photo[-1].file_id
+
+    min_bid = calc_min_bid(target)
+    balance = get_user(message.chat.id)[0]
+
+    if balance < min_bid:
+        bot.send_message(message.chat.id,
+            f"❌ <b>Недостаточно средств!</b>\n\n"
+            f"Минимальная ставка: <b>{min_bid} ₽</b>\nУ тебя: <b>{balance} ₽</b>",
+            parse_mode='HTML', reply_markup=back_kb())
+        return
+
+    sent = bot.send_message(message.chat.id,
+        f"✅ Фото принято.\n\n💰 Минимальная ставка: <b>{min_bid} ₽</b>\n"
+        f"💎 Баланс: <b>{balance} ₽</b>\n\nВведи сумму ставки (не меньше {min_bid} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(sent, lambda m: do_photo_pay(m, target, file_id, min_bid))
+
+
+def do_photo_pay(message, target, file_id, min_bid):
+    try:
+        pay = int((message.text or "").strip())
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_kb())
+        return
+    if pay < min_bid:
+        bot.send_message(message.chat.id, f"❌ Ставка не меньше <b>{min_bid} ₽</b>.",
+            parse_mode='HTML', reply_markup=back_kb()); return
+    balance = get_user(message.chat.id)[0]
+    if balance < pay:
+        bot.send_message(message.chat.id, f"❌ Не хватает <b>{pay - balance} ₽</b>.",
+            parse_mode='HTML', reply_markup=back_kb()); return
+
+    add_bal(message.chat.id, -pay)
+
+    try:
+        file_path = bot.get_file(file_id).file_path
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"download {resp.status_code}")
+        photo_bytes = resp.content
+        if target == "channel_photo":
+            bot.set_chat_photo(CHANNEL_ID, photo_bytes)
+        else:
+            bot.set_chat_photo(CHAT_ID, photo_bytes)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Не удалось поставить фото: {e}", reply_markup=back_kb())
+        return
+
+    set_auc(target, pay, message.chat.id, file_id)
+    bot.send_message(message.chat.id,
+        f"✅ Фото изменено!\n💸 Ставка: <b>{pay} ₽</b>\n"
+        f"Следующая ставка — от <b>{pay + BID_STEP} ₽</b>.",
+        parse_mode='HTML', reply_markup=back_kb())
+    notify_admin(f"🖼 <b>Смена фото ({target})</b>\n👤 <code>{message.chat.id}</code>\n💵 {pay} ₽")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "ch_photo")
+def cb_chphoto(c):
+    bot.answer_callback_query(c.id)
+    delete_prev(c.message.chat.id, c.message.message_id)
+    s = bot.send_message(c.message.chat.id,
+        f"🖼 Отправь новое <b>фото канала</b> (мин. ставка {calc_min_bid('channel_photo')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_photo_change(m, "channel_photo"))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "chat_photo")
+def cb_chatphoto(c):
+    bot.answer_callback_query(c.id)
+    delete_prev(c.message.chat.id, c.message.message_id)
+    s = bot.send_message(c.message.chat.id,
+        f"🖼 Отправь новое <b>фото чата</b> (мин. ставка {calc_min_bid('chat_photo')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_photo_change(m, "chat_photo"))
 
 
 # ============================================================
