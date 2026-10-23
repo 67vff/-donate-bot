@@ -14,6 +14,8 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', '8000630493'))
 GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 CHAT_ID = os.getenv('CHAT_ID')
+CHANNEL_LINK = os.getenv('CHANNEL_LINK', '')
+CHAT_LINK = os.getenv('CHAT_LINK', '')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
 PAY_BASE_URL = os.getenv('PAY_BASE_URL', 'https://bot-1792590140-8792-maks746395.bothost.tech')
@@ -21,8 +23,8 @@ PAY_BASE_URL = os.getenv('PAY_BASE_URL', 'https://bot-1792590140-8792-maks746395
 MIN_TOPUP, MAX_TOPUP = 50, 15000
 AD_COST = 500
 MAX_CHANNEL_POSTS = 5
-MIN_PRICE = 50          # минимальная ставка за смену названия/описания
-PRICE_STEP_PERCENT = 10 # каждая следующая смена +10% от предыдущей
+MIN_PRICE = 50
+PRICE_STEP_PERCENT = 10
 TEST_BALANCE = 50000000
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -33,6 +35,8 @@ print(f"[CONFIG] BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING!'}", flush=True)
 print(f"[CONFIG] GIGACHAT: {'OK' if GIGACHAT_AUTH_KEY else 'MISSING'}", flush=True)
 print(f"[CONFIG] CHANNEL_ID: {CHANNEL_ID or 'MISSING'}", flush=True)
 print(f"[CONFIG] CHAT_ID: {CHAT_ID or 'MISSING'}", flush=True)
+print(f"[CONFIG] CHANNEL_LINK: {'OK' if CHANNEL_LINK else 'MISSING'}", flush=True)
+print(f"[CONFIG] CHAT_LINK: {'OK' if CHAT_LINK else 'MISSING'}", flush=True)
 print(f"[CONFIG] ADMIN_ID: {ADMIN_ID}", flush=True)
 
 
@@ -55,14 +59,9 @@ def init_db():
         banned INTEGER DEFAULT 0, ban_reason TEXT DEFAULT '')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, chat_id INTEGER,
         amount INTEGER, paid INTEGER DEFAULT 0, created INTEGER)""")
-    # Цены за смену названия/описания для 4 объектов
-    cur.execute("""CREATE TABLE IF NOT EXISTS prices (
-        target TEXT PRIMARY KEY,
-        current_price INTEGER DEFAULT 50,
-        last_user INTEGER DEFAULT 0,
-        last_value TEXT DEFAULT '',
-        updated INTEGER DEFAULT 0
-    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS prices (target TEXT PRIMARY KEY,
+        current_price INTEGER DEFAULT 50, last_user INTEGER DEFAULT 0,
+        last_value TEXT DEFAULT '', updated INTEGER DEFAULT 0)""")
     for t in ("channel_name", "channel_desc", "chat_name", "chat_desc"):
         cur.execute("INSERT OR IGNORE INTO prices (target, current_price) VALUES (?, ?)", (t, MIN_PRICE))
     c.commit(); c.close()
@@ -83,9 +82,9 @@ def grant_admin_test_balance():
     elif row[0] == 0:
         cur.execute("UPDATE users SET balance=? WHERE chat_id=?", (TEST_BALANCE, ADMIN_ID))
         c.commit()
-        print(f"[TEST] ADMIN_ID {ADMIN_ID} получил тестовый баланс {TEST_BALANCE} ₽", flush=True)
+        print(f"[TEST] ADMIN_ID {ADMIN_ID} получил {TEST_BALANCE} ₽", flush=True)
     else:
-        print(f"[TEST] ADMIN_ID {ADMIN_ID} уже имеет баланс {row[0]} ₽", flush=True)
+        print(f"[TEST] ADMIN_ID {ADMIN_ID} уже имеет {row[0]} ₽", flush=True)
     c.close()
 
 
@@ -160,8 +159,9 @@ def giga_token():
 def ai_check(text, ctx="channel"):
     if not text:
         return True, "OK"
-    if re.search(r'@\w+', text):
-        return False, "Ники (@username) запрещены"
+    # Ники запрещены ТОЛЬКО в названиях/описаниях (в рекламе/постах — можно)
+    if ctx in ("title", "description") and re.search(r'@\w+', text):
+        return False, "Ники (@username) запрещены в названии/описании"
     if re.search(r'https?://|t\.me/|www\.', text, re.I):
         return False, "Ссылки запрещены"
     if re.search(r'\b(карт[ау]|кошел[её]к|звезд[ыа]|рубл[ьия]|реквизит|перевод)\b', text, re.I):
@@ -267,7 +267,7 @@ def health():
 
 
 # ============================================================
-# МЕНЮ (с удалением старого сообщения)
+# МЕНЮ
 # ============================================================
 
 def main_menu():
@@ -275,6 +275,7 @@ def main_menu():
     m.add(telebot.types.InlineKeyboardButton("💰 Пополнить баланс", callback_data="topup"))
     m.add(telebot.types.InlineKeyboardButton("📺 Управлять каналом", callback_data="channel_menu"))
     m.add(telebot.types.InlineKeyboardButton("💬 Управлять чатом", callback_data="chat_menu"))
+    m.add(telebot.types.InlineKeyboardButton("🔗 Открыть канал", callback_data="open_links"))
     return m
 
 
@@ -323,6 +324,22 @@ def start(message):
         pass
     if message.from_user.username:
         upd(message.chat.id, 'username', f"@{message.from_user.username}")
+
+    u = get_user(message.chat.id)
+
+    # Пригласительные ссылки (показываем при каждом /start, но отдельным сообщением)
+    links = telebot.types.InlineKeyboardMarkup()
+    if CHANNEL_LINK:
+        links.add(telebot.types.InlineKeyboardButton("📺 Войти в канал", url=CHANNEL_LINK))
+    if CHAT_LINK:
+        links.add(telebot.types.InlineKeyboardButton("💬 Войти в чат", url=CHAT_LINK))
+
+    if links.keyboard:
+        bot.send_message(message.chat.id,
+            f"💎 <b>Добро пожаловать!</b>\n\n"
+            f"👇 Сначала подпишись на канал и чат:",
+            parse_mode='HTML', reply_markup=links)
+
     bot.send_message(message.chat.id, main_text(message.chat.id),
                      parse_mode='HTML', reply_markup=main_menu())
 
@@ -333,6 +350,23 @@ def cb_back(c):
     try:
         bot.edit_message_text(main_text(c.message.chat.id), chat_id=c.message.chat.id,
                               message_id=c.message.message_id, parse_mode='HTML', reply_markup=main_menu())
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "open_links")
+def cb_open_links(c):
+    bot.answer_callback_query(c.id)
+    m = telebot.types.InlineKeyboardMarkup()
+    if CHANNEL_LINK:
+        m.add(telebot.types.InlineKeyboardButton("📺 Канал", url=CHANNEL_LINK))
+    if CHAT_LINK:
+        m.add(telebot.types.InlineKeyboardButton("💬 Чат", url=CHAT_LINK))
+    m.add(telebot.types.InlineKeyboardButton("⬅️ В меню", callback_data="back_main"))
+    try:
+        bot.edit_message_text("🔗 <b>Наши ссылки</b>\n\nВыбери, куда перейти:",
+            chat_id=c.message.chat.id, message_id=c.message.message_id,
+            parse_mode='HTML', reply_markup=m)
     except Exception:
         pass
 
@@ -390,31 +424,33 @@ def cb_chatmenu(c):
     except Exception:
         pass
 
-
 # ============================================================
-# СМЕНА НАЗВАНИЯ / ОПИСАНИЯ (фикс цена +10%)
+# СМЕНА НАЗВАНИЯ / ОПИСАНИЯ (2 шага: текст → сумма)
 # ============================================================
 
 def calc_min_price(target):
-    """Минимальная цена для следующей смены: 50 при первой, иначе +10% от прошлой."""
     price, last_user, last_value = get_price(target)
     if not last_value:
         return MIN_PRICE
     return int(price * (1 + PRICE_STEP_PERCENT / 100.0))
 
 
-def do_change(message, target, kind):
-    """kind: 'title' или 'description'"""
+def do_change_text(message, target, kind):
+    """Шаг 1: пользователь ввёл название/описание."""
     new = (message.text or "").strip()
+
     if kind == 'title' and not (1 <= len(new) <= 128):
-        bot.send_message(message.chat.id, "❌ 1–128 символов.", reply_markup=back_kb()); return
+        bot.send_message(message.chat.id, "❌ Название от 1 до 128 символов.", reply_markup=back_kb())
+        return
     if kind == 'description' and not (1 <= len(new) <= 255):
-        bot.send_message(message.chat.id, "❌ 1–255 символов.", reply_markup=back_kb()); return
+        bot.send_message(message.chat.id, "❌ Описание от 1 до 255 символов.", reply_markup=back_kb())
+        return
 
     ctx = 'title' if kind == 'title' else 'description'
     ok, r = ai_check(new, ctx)
     if not ok:
-        bot.send_message(message.chat.id, f"❌ ИИ: {r}", reply_markup=back_kb()); return
+        bot.send_message(message.chat.id, f"❌ ИИ: {r}", reply_markup=back_kb())
+        return
 
     min_price = calc_min_price(target)
     balance = get_user(message.chat.id)[0]
@@ -423,94 +459,110 @@ def do_change(message, target, kind):
         bot.send_message(message.chat.id,
             f"❌ <b>Недостаточно средств!</b>\n\n"
             f"Минимальная ставка: <b>{min_price} ₽</b>\n"
-            f"У тебя на балансе: <b>{balance} ₽</b>\n\n"
+            f"У тебя: <b>{balance} ₽</b>\n\n"
             f"Пополни баланс и попробуй снова.",
             parse_mode='HTML', reply_markup=back_kb())
         return
 
-    # Спрашиваем, сколько он хочет заплатить (не меньше min_price)
     sent = bot.send_message(message.chat.id,
+        f"✅ Текст принят: <b>{new}</b>\n\n"
         f"💰 Минимальная ставка: <b>{min_price} ₽</b>\n"
-        f"Баланс: <b>{balance} ₽</b>\n\n"
+        f"💎 Баланс: <b>{balance} ₽</b>\n\n"
         f"Введи сумму, которую готов заплатить (не меньше {min_price} ₽):",
         parse_mode='HTML')
-    bot.register_next_step_handler(sent, lambda m: do_pay_and_change(m, target, kind, new, min_price))
+    bot.register_next_step_handler(sent, lambda m: do_change_pay(m, target, kind, new, min_price))
 
 
-def do_pay_and_change(message, target, kind, new, min_price):
+def do_change_pay(message, target, kind, new_text, min_price):
+    """Шаг 2: пользователь ввёл сумму."""
     try:
-        pay = int(message.text.strip())
+        pay = int((message.text or "").strip())
     except ValueError:
-        bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_kb()); return
+        bot.send_message(message.chat.id, "❌ Введи число (сумму в рублях).", reply_markup=back_kb())
+        return
 
     if pay < min_price:
         bot.send_message(message.chat.id,
             f"❌ Ставка должна быть не меньше <b>{min_price} ₽</b>.",
-            parse_mode='HTML', reply_markup=back_kb()); return
+            parse_mode='HTML', reply_markup=back_kb())
+        return
 
     balance = get_user(message.chat.id)[0]
     if balance < pay:
         bot.send_message(message.chat.id,
-            f"❌ Не хватает <b>{pay - balance} ₽</b>.\n"
-            f"Баланс: <b>{balance} ₽</b>, нужно: <b>{pay} ₽</b>.",
-            parse_mode='HTML', reply_markup=back_kb()); return
+            f"❌ <b>Не хватает средств!</b>\n\n"
+            f"Нужно: <b>{pay} ₽</b>\n"
+            f"У тебя: <b>{balance} ₽</b>\n"
+            f"Не хватает: <b>{pay - balance} ₽</b>\n\n"
+            f"Пополни баланс и попробуй снова.",
+            parse_mode='HTML', reply_markup=back_kb())
+        return
 
     add_bal(message.chat.id, -pay)
-    set_price(target, pay, message.chat.id, new)
+    set_price(target, pay, message.chat.id, new_text)
 
     try:
         if target == "channel_name":
-            bot.set_chat_title(CHANNEL_ID, new)
+            bot.set_chat_title(CHANNEL_ID, new_text)
         elif target == "channel_desc":
-            bot.set_chat_description(CHANNEL_ID, new)
+            bot.set_chat_description(CHANNEL_ID, new_text)
         elif target == "chat_name":
-            bot.set_chat_title(CHAT_ID, new)
+            bot.set_chat_title(CHAT_ID, new_text)
         elif target == "chat_desc":
-            bot.set_chat_description(CHAT_ID, new)
+            bot.set_chat_description(CHAT_ID, new_text)
     except Exception as e:
-        bot.send_message(message.chat.id, f"⚠️ {e}", reply_markup=back_kb()); return
+        bot.send_message(message.chat.id, f"⚠️ Не удалось изменить: {e}", reply_markup=back_kb())
+        return
 
     next_price = int(pay * 1.1)
     bot.send_message(message.chat.id,
-        f"✅ Изменено!\n\n"
-        f"📝 Новое значение: <b>{new}</b>\n"
+        f"✅ <b>Изменено!</b>\n\n"
+        f"📝 Новое значение: <b>{new_text}</b>\n"
         f"💸 Заплачено: <b>{pay} ₽</b>\n"
         f"💰 Остаток: <b>{get_user(message.chat.id)[0]} ₽</b>\n\n"
-        f"Следующая смена будет стоить от <b>{next_price} ₽</b>.",
+        f"Следующая смена — от <b>{next_price} ₽</b>.",
         parse_mode='HTML', reply_markup=back_kb())
-    notify_admin(f"✏️ <b>Смена {target}</b>\n👤 <code>{message.chat.id}</code>\n💵 {pay} ₽\n📝 {new}")
+    notify_admin(f"✏️ <b>Смена {target}</b>\n👤 <code>{message.chat.id}</code>\n💵 {pay} ₽\n📝 {new_text}")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "ch_name")
 def cb_chname(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
-    s = bot.send_message(c.message.chat.id, f"✏️ Новое название канала (мин. {calc_min_price('channel_name')} ₽):")
-    bot.register_next_step_handler(s, lambda m: do_change(m, "channel_name", "title"))
+    s = bot.send_message(c.message.chat.id,
+        f"✏️ Введи новое <b>название канала</b> (мин. ставка {calc_min_price('channel_name')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_change_text(m, "channel_name", "title"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "ch_desc")
 def cb_chdesc(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
-    s = bot.send_message(c.message.chat.id, f"📝 Новое описание канала (мин. {calc_min_price('channel_desc')} ₽):")
-    bot.register_next_step_handler(s, lambda m: do_change(m, "channel_desc", "description"))
+    s = bot.send_message(c.message.chat.id,
+        f"📝 Введи новое <b>описание канала</b> (мин. ставка {calc_min_price('channel_desc')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_change_text(m, "channel_desc", "description"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "chat_name")
 def cb_chname2(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
-    s = bot.send_message(c.message.chat.id, f"✏️ Новое название чата (мин. {calc_min_price('chat_name')} ₽):")
-    bot.register_next_step_handler(s, lambda m: do_change(m, "chat_name", "title"))
+    s = bot.send_message(c.message.chat.id,
+        f"✏️ Введи новое <b>название чата</b> (мин. ставка {calc_min_price('chat_name')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_change_text(m, "chat_name", "title"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "chat_desc")
 def cb_chdesc2(c):
     bot.answer_callback_query(c.id)
     delete_prev(c.message.chat.id, c.message.message_id)
-    s = bot.send_message(c.message.chat.id, f"📝 Новое описание чата (мин. {calc_min_price('chat_desc')} ₽):")
-    bot.register_next_step_handler(s, lambda m: do_change(m, "chat_desc", "description"))
+    s = bot.send_message(c.message.chat.id,
+        f"📝 Введи новое <b>описание чата</b> (мин. ставка {calc_min_price('chat_desc')} ₽):",
+        parse_mode='HTML')
+    bot.register_next_step_handler(s, lambda m: do_change_text(m, "chat_desc", "description"))
 
 
 # ============================================================
