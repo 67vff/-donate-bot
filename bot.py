@@ -5,6 +5,10 @@ from flask import Flask, request, jsonify
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ============================================================
+# КОНФИГ
+# ============================================================
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8000630493'))
 GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
@@ -16,6 +20,7 @@ PAY_BASE_URL = os.getenv('PAY_BASE_URL', 'https://bot-1792590140-8792-maks746395
 
 MIN_TOPUP, MAX_TOPUP = 50, 15000
 MIN_AUCTION_START, AUCTION_STEP, AD_COST, MAX_CHANNEL_POSTS = 50, 10, 500, 5
+TEST_BALANCE = 50000000  # 50 млн ₽ только для ADMIN_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -25,7 +30,12 @@ print(f"[CONFIG] BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING!'}", flush=True)
 print(f"[CONFIG] GIGACHAT: {'OK' if GIGACHAT_AUTH_KEY else 'MISSING'}", flush=True)
 print(f"[CONFIG] CHANNEL_ID: {CHANNEL_ID or 'MISSING'}", flush=True)
 print(f"[CONFIG] CHAT_ID: {CHAT_ID or 'MISSING'}", flush=True)
+print(f"[CONFIG] ADMIN_ID: {ADMIN_ID}", flush=True)
 
+
+# ============================================================
+# БАЗА
+# ============================================================
 
 def get_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -53,6 +63,30 @@ def init_db():
 init_db()
 print("[DB] OK", flush=True)
 
+
+def grant_admin_test_balance():
+    c = get_conn(); cur = c.cursor()
+    cur.execute("SELECT balance FROM users WHERE chat_id=?", (ADMIN_ID,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO users (chat_id, balance, reputation) VALUES (?, ?, 0)", (ADMIN_ID, TEST_BALANCE))
+        c.commit()
+        print(f"[TEST] ADMIN_ID {ADMIN_ID} создан с балансом {TEST_BALANCE} ₽", flush=True)
+    elif row[0] == 0:
+        cur.execute("UPDATE users SET balance=? WHERE chat_id=?", (TEST_BALANCE, ADMIN_ID))
+        c.commit()
+        print(f"[TEST] ADMIN_ID {ADMIN_ID} получил тестовый баланс {TEST_BALANCE} ₽", flush=True)
+    else:
+        print(f"[TEST] ADMIN_ID {ADMIN_ID} уже имеет баланс {row[0]} ₽ — не трогаем", flush=True)
+    c.close()
+
+
+grant_admin_test_balance()
+
+
+# ============================================================
+# ПОЛЬЗОВАТЕЛИ
+# ============================================================
 
 def get_user(cid):
     c = get_conn(); cur = c.cursor()
@@ -82,10 +116,15 @@ def get_auc():
 
 
 def set_auc(target, bid, user, val):
-    c = get_conn(); c.cursor().execute("UPDATE auctions SET target=?, current_bid=?, current_user=?, current_value=?, updated=? WHERE id=1",
-                                       (target, bid, user, val, int(time.time())))
+    c = get_conn(); c.cursor().execute(
+        "UPDATE auctions SET target=?, current_bid=?, current_user=?, current_value=?, updated=? WHERE id=1",
+        (target, bid, user, val, int(time.time())))
     c.commit(); c.close()
 
+
+# ============================================================
+# GIGACHAT
+# ============================================================
 
 _giga = {"t": None, "e": 0}
 _glock = threading.Lock()
@@ -162,7 +201,10 @@ def ban_user(uid, reason):
     upd(uid, 'banned', 1); upd(uid, 'ban_reason', reason)
 
 
-# ---------------- PAY ----------------
+# ============================================================
+# ОПЛАТА
+# ============================================================
+
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     return f'''<html><head><meta charset="utf-8"></head><body onload="document.forms[0].submit()">
@@ -214,7 +256,10 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# ---------------- MENU ----------------
+# ============================================================
+# МЕНЮ
+# ============================================================
+
 def main_menu():
     m = telebot.types.InlineKeyboardMarkup()
     m.add(telebot.types.InlineKeyboardButton("💰 Пополнить баланс", callback_data="topup"))
@@ -266,7 +311,8 @@ def start(message):
 def cb_back(c):
     u = get_user(c.message.chat.id)
     try:
-        bot.edit_message_text(f"💎 <b>Studio</b>\n\n💰 Баланс: <b>{u[0]} ₽</b>\n⭐ Репутация: <b>{u[1]}</b>\n\nВыбери действие 👇",
+        bot.edit_message_text(
+            f"💎 <b>Studio</b>\n\n💰 Баланс: <b>{u[0]} ₽</b>\n⭐ Репутация: <b>{u[1]}</b>\n\nВыбери действие 👇",
             chat_id=c.message.chat.id, message_id=c.message.message_id, parse_mode='HTML', reply_markup=main_menu())
     except Exception:
         pass
@@ -318,8 +364,11 @@ def cb_chatmenu(c):
     bot.answer_callback_query(c.id)
 
 
-# ---------------- AUCTION / CHANNEL NAME ----------------
-def do_name_change(message, target, chat_target, ctx):
+# ============================================================
+# СМЕНА НАЗВАНИЯ / ОПИСАНИЯ
+# ============================================================
+
+def do_name_change(message, target, ctx):
     new = (message.text or "").strip()
     if not (1 <= len(new) <= 128):
         bot.send_message(message.chat.id, "❌ 1–128 символов.", reply_markup=back_kb()); return
@@ -344,7 +393,7 @@ def do_name_change(message, target, chat_target, ctx):
     notify_admin(f"✏️ <b>Смена названия {target}</b>\n👤 <code>{message.chat.id}</code>\n💵 {min_bid} ₽\n📝 {new}")
 
 
-def do_desc_change(message, target, chat_target, ctx):
+def do_desc_change(message, target, ctx):
     new = (message.text or "").strip()
     if not (1 <= len(new) <= 255):
         bot.send_message(message.chat.id, "❌ 1–255 символов.", reply_markup=back_kb()); return
@@ -373,29 +422,33 @@ def do_desc_change(message, target, chat_target, ctx):
 def cb_chname(c):
     bot.answer_callback_query(c.id)
     s = bot.send_message(c.message.chat.id, "✏️ Новое название канала (аукцион, от 50₽):")
-    bot.register_next_step_handler(s, lambda m: do_name_change(m, "channel_name", CHANNEL_ID, "title"))
+    bot.register_next_step_handler(s, lambda m: do_name_change(m, "channel_name", "title"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "ch_desc")
 def cb_chdesc(c):
     bot.answer_callback_query(c.id)
     s = bot.send_message(c.message.chat.id, "📝 Новое описание канала (аукцион, от 50₽):")
-    bot.register_next_step_handler(s, lambda m: do_desc_change(m, "channel_desc", CHANNEL_ID, "description"))
+    bot.register_next_step_handler(s, lambda m: do_desc_change(m, "channel_desc", "description"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "chat_name")
 def cb_chname2(c):
     bot.answer_callback_query(c.id)
     s = bot.send_message(c.message.chat.id, "✏️ Новое название чата (аукцион, от 50₽):")
-    bot.register_next_step_handler(s, lambda m: do_name_change(m, "chat_name", CHAT_ID, "title"))
+    bot.register_next_step_handler(s, lambda m: do_name_change(m, "chat_name", "title"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "chat_desc")
 def cb_chdesc2(c):
     bot.answer_callback_query(c.id)
     s = bot.send_message(c.message.chat.id, "📝 Новое описание чата (аукцион, от 50₽):")
-    bot.register_next_step_handler(s, lambda m: do_desc_change(m, "chat_desc", CHAT_ID, "description"))
+    bot.register_next_step_handler(s, lambda m: do_desc_change(m, "chat_desc", "description"))
 
+
+# ============================================================
+# ПОСТЫ И РЕКЛАМА
+# ============================================================
 
 @bot.callback_query_handler(func=lambda c: c.data == "ch_post")
 def cb_chpost(c):
@@ -463,6 +516,10 @@ def cb_rep(c):
         parse_mode='HTML', reply_markup=back_kb())
 
 
+# ============================================================
+# АУКЦИОН
+# ============================================================
+
 @bot.callback_query_handler(func=lambda c: c.data == "auction_menu")
 def cb_auc(c):
     bot.answer_callback_query(c.id)
@@ -485,7 +542,10 @@ def cb_bid(c):
     bot.send_message(c.message.chat.id, "Используй «Изменить название» — ставка делается там.", reply_markup=back_kb())
 
 
-# ---------------- MODERATION ----------------
+# ============================================================
+# МОДЕРАЦИЯ
+# ============================================================
+
 @bot.channel_post_handler(func=lambda m: True)
 def on_channel_post(m):
     if not m.text:
@@ -532,10 +592,13 @@ def on_join(r):
     ok, reason = ai_check(f"{name} {uname}", "title")
     if not ok:
         ban_user(uid, reason)
-        notify_admin(f"🚫 Заявка отклонена и бан\n👤 <code>{uid}</code> {uname}\n{rreason if False else reason}")
+        notify_admin(f"🚫 Заявка отклонена и бан\n👤 <code>{uid}</code> {uname}\n{reason}")
 
 
-# ---------------- ADMIN COMMANDS ----------------
+# ============================================================
+# АДМИН-КОМАНДЫ
+# ============================================================
+
 @bot.message_handler(commands=['bonus'])
 def cmd_bonus(message):
     if message.from_user.id != ADMIN_ID:
@@ -567,7 +630,10 @@ def cmd_rep(message):
     bot.send_message(message.chat.id, f"✅ +{amt} репутации {cid}")
 
 
-# ---------------- RUN ----------------
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
 def run_flask():
     port = int(os.getenv('PORT', 3000))
     print(f"[FLASK] 0.0.0.0:{port}", flush=True)
